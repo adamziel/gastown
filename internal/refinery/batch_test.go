@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +57,7 @@ func createFeatureBranch(t *testing.T, workDir, branchName, filename, content st
 	writeFile(t, workDir, filename, content)
 	run(t, workDir, "git", "add", ".")
 	run(t, workDir, "git", "commit", "-m", fmt.Sprintf("feat: add %s", filename))
+	run(t, workDir, "git", "push", "-u", "origin", branchName)
 	run(t, workDir, "git", "checkout", "main")
 }
 
@@ -66,6 +68,7 @@ func createConflictingBranch(t *testing.T, workDir, branchName, filename, conten
 	writeFile(t, workDir, filename, content)
 	run(t, workDir, "git", "add", ".")
 	run(t, workDir, "git", "commit", "-m", fmt.Sprintf("feat: modify %s", filename))
+	run(t, workDir, "git", "push", "-u", "origin", branchName)
 	run(t, workDir, "git", "checkout", "main")
 }
 
@@ -87,6 +90,12 @@ func writeFile(t *testing.T, dir, name, content string) {
 	}
 }
 
+func readRemoteFile(t *testing.T, workDir, target, filename string) string {
+	t.Helper()
+	run(t, workDir, "git", "fetch", "origin", target)
+	return run(t, workDir, "git", "show", "origin/"+target+":"+filename)
+}
+
 func newTestEngineer(t *testing.T, workDir string, g *gitpkg.Git) *Engineer {
 	t.Helper()
 	r := &rig.Rig{Name: "test-rig", Path: workDir}
@@ -101,6 +110,131 @@ func newTestEngineer(t *testing.T, workDir string, g *gitpkg.Git) *Engineer {
 	}
 	e.mergeSlotRelease = func(holder string) error { return nil }
 	return e
+}
+
+func TestDoMerge_UsesDisposableWorktreeWhenRefineryWorktreeDirty(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+
+	createFeatureBranch(t, workDir, "feat/disposable-safe", "new-file.txt", "from branch\n")
+
+	// Simulate stale/dirty refinery state that used to block queue draining:
+	// the untracked file would be overwritten by the source branch if the
+	// merge happened in the long-lived refinery worktree.
+	writeFile(t, workDir, "new-file.txt", "local dirty state\n")
+
+	result := e.doMerge(context.Background(), "feat/disposable-safe", "main", "gt-test")
+	if !result.Success {
+		t.Fatalf("doMerge failed: %s", result.Error)
+	}
+	if result.MergeCommit == "" {
+		t.Fatalf("expected merge commit to be recorded")
+	}
+
+	landed := readRemoteFile(t, workDir, "main", "new-file.txt")
+	if landed != "from branch" {
+		t.Fatalf("origin/main:new-file.txt = %q, want branch content", landed)
+	}
+
+	localDirty, err := os.ReadFile(filepath.Join(workDir, "new-file.txt"))
+	if err != nil {
+		t.Fatalf("read dirty long-lived file: %v", err)
+	}
+	if string(localDirty) != "local dirty state\n" {
+		t.Fatalf("long-lived worktree was mutated, got %q", string(localDirty))
+	}
+	if _, err := os.Stat(e.disposableMergeWorktreeRoot()); !os.IsNotExist(err) {
+		t.Fatalf("disposable merge worktree root should be cleaned up, stat err=%v", err)
+	}
+}
+
+func TestProcessBatch_UsesDisposableWorktreeWhenRefineryWorktreeDirty(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+
+	createFeatureBranch(t, workDir, "feature-a", "a.txt", "hello a\n")
+	createFeatureBranch(t, workDir, "feature-b", "b.txt", "hello b\n")
+
+	writeFile(t, workDir, "a.txt", "local dirty state\n")
+
+	batch := []*MRInfo{
+		makeMR("mr-a", "feature-a", "main"),
+		makeMR("mr-b", "feature-b", "main"),
+	}
+	result := e.ProcessBatch(context.Background(), batch, "main", DefaultBatchConfig())
+	if result.Error != nil {
+		t.Fatalf("unexpected error: %v", result.Error)
+	}
+	if len(result.Merged) != 2 {
+		t.Fatalf("expected 2 merged, got %d", len(result.Merged))
+	}
+
+	if got := readRemoteFile(t, workDir, "main", "a.txt"); got != "hello a" {
+		t.Fatalf("origin/main:a.txt = %q, want hello a", got)
+	}
+	if got := readRemoteFile(t, workDir, "main", "b.txt"); got != "hello b" {
+		t.Fatalf("origin/main:b.txt = %q, want hello b", got)
+	}
+	localDirty, err := os.ReadFile(filepath.Join(workDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("read dirty long-lived file: %v", err)
+	}
+	if string(localDirty) != "local dirty state\n" {
+		t.Fatalf("long-lived worktree was mutated, got %q", string(localDirty))
+	}
+	if _, err := os.Stat(e.disposableMergeWorktreeRoot()); !os.IsNotExist(err) {
+		t.Fatalf("disposable merge worktree root should be cleaned up, stat err=%v", err)
+	}
+}
+
+func TestSlingConflictResolutionTask_UsesMutationEnvAndBaseBranch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stub test")
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "gt.log")
+	gtPath := filepath.Join(binDir, "gt")
+	script := fmt.Sprintf(`#!/bin/sh
+printf 'ENV BD_READONLY=%%s BD_DOLT_AUTO_COMMIT=%%s\n' "${BD_READONLY:-}" "${BD_DOLT_AUTO_COMMIT:-}" >> %q
+printf 'ARGS' >> %q
+for arg in "$@"; do printf ' [%%s]' "$arg" >> %q; done
+printf '\n' >> %q
+`, logPath, logPath, logPath, logPath)
+	if err := os.WriteFile(gtPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_READONLY", "true")
+	t.Setenv("BD_DOLT_AUTO_COMMIT", "off")
+
+	e := NewEngineer(&rig.Rig{Name: "testrig", Path: t.TempDir()})
+	e.workDir = t.TempDir()
+	mr := &MRInfo{
+		ID:          "gt-mr-1",
+		Branch:      "polecat/nux/gt-1",
+		Target:      "main",
+		SourceIssue: "gt-1",
+	}
+	if err := e.slingConflictResolutionTask("gt-conflict-1", mr); err != nil {
+		t.Fatalf("slingConflictResolutionTask: %v", err)
+	}
+
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read gt log: %v", err)
+	}
+	logText := string(logData)
+	if !strings.Contains(logText, "ENV BD_READONLY= BD_DOLT_AUTO_COMMIT=on") {
+		t.Fatalf("sling env not mutation-safe:\n%s", logText)
+	}
+	if !strings.Contains(logText, "ARGS [sling] [gt-conflict-1] [testrig] [--no-boot] [--base-branch=main]") {
+		t.Fatalf("sling args missing bead/rig/base branch:\n%s", logText)
+	}
+	if !strings.Contains(logText, "Branch=polecat/nux/gt-1 target=main source_issue=gt-1") {
+		t.Fatalf("sling args missing MR context:\n%s", logText)
+	}
 }
 
 func makeMR(id, branch, target string) *MRInfo {
@@ -424,11 +558,11 @@ func TestProcessBatch_MultipleMRs_AllPass(t *testing.T) {
 		t.Error("expected merge commit SHA")
 	}
 
-	// Verify all files landed on main
-	run(t, workDir, "git", "checkout", "main")
+	// Verify all files landed on origin/main. Batch integration runs in a
+	// disposable worktree and leaves the long-lived checkout untouched.
 	for _, f := range []string{"a.txt", "b.txt", "c.txt"} {
-		if _, err := os.Stat(filepath.Join(workDir, f)); os.IsNotExist(err) {
-			t.Errorf("expected %s on main after batch merge", f)
+		if got := readRemoteFile(t, workDir, "main", f); got == "" {
+			t.Errorf("expected %s on origin/main after batch merge", f)
 		}
 	}
 }

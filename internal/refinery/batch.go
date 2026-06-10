@@ -94,41 +94,62 @@ func (e *Engineer) AssembleBatch(readyMRs []*MRInfo, config *BatchConfig) []*MRI
 //
 // On return, the git working directory is on the target branch with all
 // successful MR squash-merges applied (but not pushed).
+func (e *Engineer) checkoutBatchTarget(target string) (string, error) {
+	if err := e.git.FetchBranchRef("origin", target); err != nil {
+		return "", fmt.Errorf("fetch origin/%s: %w", target, err)
+	}
+	targetRef := "origin/" + target
+	if err := e.git.Checkout(targetRef); err != nil {
+		return "", fmt.Errorf("checkout %s: %w", targetRef, err)
+	}
+	baseSHA, err := e.git.Rev("HEAD")
+	if err != nil {
+		return "", fmt.Errorf("get base SHA: %w", err)
+	}
+	return baseSHA, nil
+}
+
+func (e *Engineer) batchSourceRef(mr *MRInfo) (string, error) {
+	exists, err := e.git.RemoteBranchExists("origin", mr.Branch)
+	if err != nil {
+		return "", fmt.Errorf("check remote branch %s: %w", mr.Branch, err)
+	}
+	if !exists {
+		return "", &sourceBranchMissingError{branch: mr.Branch}
+	}
+	if err := e.git.FetchBranchRef("origin", mr.Branch); err != nil {
+		return "", fmt.Errorf("fetch origin/%s: %w", mr.Branch, err)
+	}
+	return "origin/" + mr.Branch, nil
+}
+
 func (e *Engineer) BuildRebaseStack(ctx context.Context, batch []*MRInfo, target string) (stacked []*MRInfo, conflicts []*MRInfo, err error) {
 	if len(batch) == 0 {
 		return nil, nil, nil
 	}
 
-	// Checkout target and ensure it's up to date
-	if checkoutErr := e.git.Checkout(target); checkoutErr != nil {
-		return nil, nil, fmt.Errorf("checkout target %s: %w", target, checkoutErr)
-	}
-	if pullErr := e.git.Pull("origin", target); pullErr != nil {
-		_, _ = fmt.Fprintf(e.output, "[Batch] Warning: pull origin/%s: %v (continuing)\n", target, pullErr)
-	}
-
-	// Remember the base SHA to reset on retry
-	baseSHA, err := e.git.Rev("HEAD")
+	// Checkout the exact remote target in detached mode. This keeps batch stack
+	// construction usable in disposable worktrees even when the long-lived
+	// refinery worktree has the target branch checked out or dirty.
+	baseSHA, err := e.checkoutBatchTarget(target)
 	if err != nil {
-		return nil, nil, fmt.Errorf("get base SHA: %w", err)
+		return nil, nil, err
 	}
 
 	// Try to stack each MR via squash-merge
 	for _, mr := range batch {
 		_, _ = fmt.Fprintf(e.output, "[Batch] Stacking MR %s (branch %s)...\n", mr.ID, mr.Branch)
 
-		// Check branch exists
-		exists, brErr := e.git.BranchExists(mr.Branch)
-		if brErr != nil || !exists {
-			// Branch not found — escalate to mayor (gas-556)
+		sourceRef, brErr := e.batchSourceRef(mr)
+		if brErr != nil {
 			_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: branch %s not found, escalating to mayor\n", mr.ID, mr.Branch)
-			e.HandleMRInfoFailure(mr, ProcessResult{BranchNotFound: true})
+			e.HandleMRInfoFailure(mr, ProcessResult{BranchNotFound: true, Error: brErr.Error()})
 			conflicts = append(conflicts, mr)
 			continue
 		}
 
 		// Check for conflicts before merging
-		conflictFiles, conflictErr := e.git.CheckConflicts(mr.Branch, target)
+		conflictFiles, conflictErr := e.git.CheckConflicts(sourceRef, "HEAD")
 		if conflictErr != nil || len(conflictFiles) > 0 {
 			_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: conflicts detected, removing from batch\n", mr.ID)
 			conflicts = append(conflicts, mr)
@@ -139,8 +160,12 @@ func (e *Engineer) BuildRebaseStack(ctx context.Context, batch []*MRInfo, target
 			}
 			// Rebuild the stack with MRs stacked so far (minus the conflicting one)
 			for _, prev := range stacked {
-				msg := e.getMergeMessage(prev)
-				if mergeErr := e.git.MergeSquash(prev.Branch, msg); mergeErr != nil {
+				prevRef, refErr := e.batchSourceRef(prev)
+				if refErr != nil {
+					return nil, nil, fmt.Errorf("rebuild source ref for %s: %w", prev.ID, refErr)
+				}
+				msg := e.getMergeMessageFromRef(prev, prevRef)
+				if mergeErr := e.git.MergeSquash(prevRef, msg); mergeErr != nil {
 					return nil, nil, fmt.Errorf("rebuild stack for %s: %w", prev.ID, mergeErr)
 				}
 			}
@@ -148,8 +173,8 @@ func (e *Engineer) BuildRebaseStack(ctx context.Context, batch []*MRInfo, target
 		}
 
 		// Squash-merge this MR onto the stack
-		msg := e.getMergeMessage(mr)
-		if mergeErr := e.git.MergeSquash(mr.Branch, msg); mergeErr != nil {
+		msg := e.getMergeMessageFromRef(mr, sourceRef)
+		if mergeErr := e.git.MergeSquash(sourceRef, msg); mergeErr != nil {
 			_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: merge failed: %v, removing from batch\n", mr.ID, mergeErr)
 			conflicts = append(conflicts, mr)
 
@@ -158,8 +183,12 @@ func (e *Engineer) BuildRebaseStack(ctx context.Context, batch []*MRInfo, target
 				return nil, nil, fmt.Errorf("reset after merge failure: %w", resetErr)
 			}
 			for _, prev := range stacked {
-				prevMsg := e.getMergeMessage(prev)
-				if rebuildErr := e.git.MergeSquash(prev.Branch, prevMsg); rebuildErr != nil {
+				prevRef, refErr := e.batchSourceRef(prev)
+				if refErr != nil {
+					return nil, nil, fmt.Errorf("rebuild source ref for %s: %w", prev.ID, refErr)
+				}
+				prevMsg := e.getMergeMessageFromRef(prev, prevRef)
+				if rebuildErr := e.git.MergeSquash(prevRef, prevMsg); rebuildErr != nil {
 					return nil, nil, fmt.Errorf("rebuild stack for %s: %w", prev.ID, rebuildErr)
 				}
 			}
@@ -175,8 +204,12 @@ func (e *Engineer) BuildRebaseStack(ctx context.Context, batch []*MRInfo, target
 
 // getMergeMessage returns the commit message for a squash-merged MR.
 func (e *Engineer) getMergeMessage(mr *MRInfo) string {
+	return e.getMergeMessageFromRef(mr, mr.Branch)
+}
+
+func (e *Engineer) getMergeMessageFromRef(mr *MRInfo, ref string) string {
 	// Try to get the original commit message from the branch
-	msg, err := e.git.GetBranchCommitMessage(mr.Branch)
+	msg, err := e.git.GetBranchCommitMessage(ref)
 	if err != nil || strings.TrimSpace(msg) == "" {
 		// Fallback to a descriptive message
 		msg = fmt.Sprintf("Squash merge %s into %s", mr.Branch, mr.Target)
@@ -211,6 +244,28 @@ func (e *Engineer) ProcessBatch(ctx context.Context, batch []*MRInfo, target str
 	if len(batch) == 1 {
 		return e.processSingleMR(ctx, batch[0], target)
 	}
+
+	worktree, err := e.createDisposableBatchWorktree(target)
+	if err != nil {
+		result.Error = err
+		return result
+	}
+	defer worktree.cleanup()
+
+	originalGit := e.git
+	originalWorkDir := e.workDir
+	e.git = worktree.git
+	e.workDir = worktree.path
+	defer func() {
+		e.git = originalGit
+		e.workDir = originalWorkDir
+	}()
+
+	return e.processBatchOnCurrentWorktree(ctx, batch, target, batchCfg)
+}
+
+func (e *Engineer) processBatchOnCurrentWorktree(ctx context.Context, batch []*MRInfo, target string, batchCfg *BatchConfig) *BatchResult {
+	result := &BatchResult{}
 
 	_, _ = fmt.Fprintf(e.output, "[Batch] Processing batch of %d MRs targeting %s\n", len(batch), target)
 
@@ -386,9 +441,31 @@ func (e *Engineer) fastForwardBatch(ctx context.Context, stacked []*MRInfo, targ
 		}()
 	}
 
+	if err := e.git.FetchBranchRef("origin", target); err != nil {
+		if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
+			_, _ = fmt.Fprintf(e.output, "[Batch] Warning: failed to reset %s after target refresh failure: %v\n", target, resetErr)
+		}
+		result.Error = fmt.Errorf("refresh origin/%s before push: %w", target, err)
+		return result
+	}
+	currentTarget, err := e.git.Rev("origin/" + target)
+	if err != nil {
+		result.Error = fmt.Errorf("verify origin/%s before push: %w", target, err)
+		return result
+	}
+	targetIncluded, err := e.git.IsAncestor(currentTarget, tipSHA)
+	if err != nil {
+		result.Error = fmt.Errorf("verify target ancestry before push: %w", err)
+		return result
+	}
+	if !targetIncluded {
+		result.Error = fmt.Errorf("target %s moved to %s while batch was prepared; retrying on fresh base", target, shortSHA(currentTarget))
+		return result
+	}
+
 	// Push to origin
 	_, _ = fmt.Fprintf(e.output, "[Batch] Pushing %d merged MRs to origin/%s...\n", len(stacked), target)
-	if pushErr := e.git.Push("origin", target, false); pushErr != nil {
+	if pushErr := e.git.PushRef("origin", "HEAD", target, false); pushErr != nil {
 		if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
 			_, _ = fmt.Fprintf(e.output, "[Batch] Warning: failed to reset %s after push failure: %v\n", target, resetErr)
 		}
@@ -549,18 +626,18 @@ func mrIDs(mrs []*MRInfo) []string {
 
 // resetAndRebuildStack resets the target branch and rebuilds the squash-merge stack.
 func (e *Engineer) resetAndRebuildStack(mrs []*MRInfo, target string) error {
-	// Reset target to origin
-	if err := e.git.Checkout(target); err != nil {
-		return fmt.Errorf("checkout %s: %w", target, err)
-	}
-	if err := e.git.ResetHard("origin/" + target); err != nil {
-		return fmt.Errorf("reset %s: %w", target, err)
+	if _, err := e.checkoutBatchTarget(target); err != nil {
+		return err
 	}
 
 	// Rebuild the stack
 	for _, mr := range mrs {
-		msg := e.getMergeMessage(mr)
-		if err := e.git.MergeSquash(mr.Branch, msg); err != nil {
+		sourceRef, err := e.batchSourceRef(mr)
+		if err != nil {
+			return fmt.Errorf("source ref %s: %w", mr.ID, err)
+		}
+		msg := e.getMergeMessageFromRef(mr, sourceRef)
+		if err := e.git.MergeSquash(sourceRef, msg); err != nil {
 			return fmt.Errorf("squash merge %s: %w", mr.ID, err)
 		}
 	}

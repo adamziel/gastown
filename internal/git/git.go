@@ -913,6 +913,16 @@ func (g *Git) FetchBranch(remote, branch string) error {
 	return err
 }
 
+// FetchBranchRef fetches a branch into its remote-tracking ref.
+// Unlike FetchBranch, this always updates refs/remotes/<remote>/<branch>, which
+// lets disposable worktrees merge the exact remote source branch without relying
+// on stale local branch refs.
+func (g *Git) FetchBranchRef(remote, branch string) error {
+	refspec := "+refs/heads/" + branch + ":refs/remotes/" + remote + "/" + branch
+	_, err := g.run("fetch", remote, refspec)
+	return err
+}
+
 // FetchBranchShallow fetches a single branch with --depth 1 and creates the
 // remote tracking ref (e.g. origin/<branch>). Use this on shallow single-branch
 // clones to add a branch that wasn't included in the initial clone.
@@ -987,6 +997,19 @@ func (g *Git) PushWithEnv(remote, branch string, force bool, env []string) error
 		args = append(args, "--force")
 	}
 	_, err := g.runWithEnvAndTimeout(args, env, pushTimeout)
+	return err
+}
+
+// PushRef pushes an arbitrary local ref to refs/heads/<branch> on the remote.
+// This is used by disposable/detached integration worktrees where the verified
+// merge commit is HEAD, not a checked-out local branch named after the target.
+func (g *Git) PushRef(remote, srcRef, branch string, force bool) error {
+	refspec := srcRef + ":refs/heads/" + branch
+	args := []string{"push", remote, refspec}
+	if force {
+		args = append(args, "--force")
+	}
+	_, err := g.runWithTimeout(pushTimeout, args...)
 	return err
 }
 

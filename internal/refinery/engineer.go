@@ -251,6 +251,13 @@ var errMergeSlotTimeout = errors.New("merge slot contention timeout")
 // resolution can cause identical timestamps across concurrent goroutines.
 var mergeSlotSeq uint64
 
+// disposableMergeWorktreeSeq is used to create collision-resistant disposable
+// worktree paths and temporary branch names.
+var disposableMergeWorktreeSeq uint64
+
+// gtCommandContext is overridden by tests that need to observe gt subprocesses.
+var gtCommandContext = exec.CommandContext
+
 // Engineer is the merge queue processor that polls for ready merge-requests
 // and processes them according to the merge queue design.
 type Engineer struct {
@@ -488,11 +495,184 @@ type ProcessResult struct {
 	MergeCommit    string
 	Error          string
 	Conflict       bool
+	ConflictFiles  []string
 	TestsFailed    bool
 	SlotTimeout    bool // Merge slot contention timeout (distinct from build/test failure)
+	TargetMoved    bool // Target branch moved after this MR was prepared; retry on fresh base
 	BranchNotFound bool // Source branch no longer exists (e.g. cleaned up after cherry-pick)
 	NoMerge        bool // Source issue has no_merge flag — intentionally blocked, not a failure
 	NeedsApproval  bool // PR exists but lacks required approving review (merge_strategy=pr)
+}
+
+type sourceBranchMissingError struct {
+	branch string
+}
+
+func (e *sourceBranchMissingError) Error() string {
+	return fmt.Sprintf("source branch %s not found on origin", e.branch)
+}
+
+type disposableMergeWorktree struct {
+	git        *git.Git
+	path       string
+	sourceRef  string
+	targetBase string
+	tempBranch string
+	cleanup    func()
+}
+
+func (e *Engineer) createDisposableMergeWorktree(branch, target string) (*disposableMergeWorktree, error) {
+	if e.git == nil {
+		return nil, fmt.Errorf("git client is not configured")
+	}
+
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Fetching current target origin/%s...\n", target)
+	if err := e.git.FetchBranchRef("origin", target); err != nil {
+		return nil, fmt.Errorf("fetch target branch %s: %w", target, err)
+	}
+	targetBase, err := e.git.Rev("origin/" + target)
+	if err != nil {
+		return nil, fmt.Errorf("resolve origin/%s: %w", target, err)
+	}
+
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Fetching source branch origin/%s...\n", branch)
+	remoteExists, err := e.git.RemoteBranchExists("origin", branch)
+	if err != nil {
+		return nil, fmt.Errorf("checking remote source branch %s: %w", branch, err)
+	}
+	if !remoteExists {
+		return nil, &sourceBranchMissingError{branch: branch}
+	}
+	if err := e.git.FetchBranchRef("origin", branch); err != nil {
+		return nil, fmt.Errorf("fetch source branch %s: %w", branch, err)
+	}
+
+	root := e.disposableMergeWorktreeRoot()
+	if err := os.MkdirAll(root, 0755); err != nil {
+		return nil, fmt.Errorf("creating disposable worktree root: %w", err)
+	}
+
+	seq := atomic.AddUint64(&disposableMergeWorktreeSeq, 1)
+	stamp := time.Now().UnixNano()
+	path := filepath.Join(root, fmt.Sprintf("%s-%s-%d-%d",
+		sanitizeWorktreeFragment(target),
+		sanitizeWorktreeFragment(branch),
+		stamp,
+		seq,
+	))
+	_ = os.RemoveAll(path)
+
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Creating disposable merge worktree at %s (base %s)...\n",
+		path, shortSHA(targetBase))
+	if err := e.git.WorktreeAddDetached(path, targetBase); err != nil {
+		_ = os.RemoveAll(path)
+		return nil, fmt.Errorf("creating disposable merge worktree: %w", err)
+	}
+
+	tempBranch := fmt.Sprintf("refinery-temp/%s/%d-%d", sanitizeWorktreeFragment(branch), stamp, seq)
+	worktree := &disposableMergeWorktree{
+		git:        git.NewGit(path),
+		path:       path,
+		sourceRef:  "origin/" + branch,
+		targetBase: targetBase,
+		tempBranch: tempBranch,
+	}
+	worktree.cleanup = func() {
+		_ = e.git.WorktreeRemove(path, true)
+		if tempBranch != "" {
+			_ = e.git.DeleteBranch(tempBranch, true)
+		}
+		_ = os.RemoveAll(path)
+		// Remove the parent only when it is empty; ignore failures.
+		_ = os.Remove(root)
+	}
+
+	return worktree, nil
+}
+
+func (e *Engineer) createDisposableBatchWorktree(target string) (*disposableMergeWorktree, error) {
+	if e.git == nil {
+		return nil, fmt.Errorf("git client is not configured")
+	}
+
+	_, _ = fmt.Fprintf(e.output, "[Batch] Fetching current target origin/%s...\n", target)
+	if err := e.git.FetchBranchRef("origin", target); err != nil {
+		return nil, fmt.Errorf("fetch target branch %s: %w", target, err)
+	}
+	targetBase, err := e.git.Rev("origin/" + target)
+	if err != nil {
+		return nil, fmt.Errorf("resolve origin/%s: %w", target, err)
+	}
+
+	root := e.disposableMergeWorktreeRoot()
+	if err := os.MkdirAll(root, 0755); err != nil {
+		return nil, fmt.Errorf("creating disposable worktree root: %w", err)
+	}
+
+	seq := atomic.AddUint64(&disposableMergeWorktreeSeq, 1)
+	stamp := time.Now().UnixNano()
+	path := filepath.Join(root, fmt.Sprintf("%s-batch-%d-%d",
+		sanitizeWorktreeFragment(target),
+		stamp,
+		seq,
+	))
+	_ = os.RemoveAll(path)
+
+	_, _ = fmt.Fprintf(e.output, "[Batch] Creating disposable batch worktree at %s (base %s)...\n",
+		path, shortSHA(targetBase))
+	if err := e.git.WorktreeAddDetached(path, targetBase); err != nil {
+		_ = os.RemoveAll(path)
+		return nil, fmt.Errorf("creating disposable batch worktree: %w", err)
+	}
+
+	worktree := &disposableMergeWorktree{
+		git:        git.NewGit(path),
+		path:       path,
+		targetBase: targetBase,
+	}
+	worktree.cleanup = func() {
+		_ = e.git.WorktreeRemove(path, true)
+		_ = os.RemoveAll(path)
+		_ = os.Remove(root)
+	}
+
+	return worktree, nil
+}
+
+func (e *Engineer) disposableMergeWorktreeRoot() string {
+	base := filepath.Dir(e.workDir)
+	if base == "." || base == string(filepath.Separator) || base == "" {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, ".refinery-merge-worktrees")
+}
+
+func sanitizeWorktreeFragment(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
+	}
+	if out == "" {
+		out = "branch"
+	}
+	if len(out) > 72 {
+		out = out[:72]
+		out = strings.TrimRight(out, "-")
+	}
+	return out
 }
 
 // doMerge performs the actual git merge operation.
@@ -509,60 +689,59 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		}
 	}
 
-	// Step 1: Verify source branch exists locally (shared .repo.git with polecats)
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Checking local branch %s...\n", branch)
-	exists, err := e.git.BranchExists(branch)
+	worktree, err := e.createDisposableMergeWorktree(branch, target)
 	if err != nil {
+		var missing *sourceBranchMissingError
+		if errors.As(err, &missing) {
+			return ProcessResult{
+				Success:        false,
+				BranchNotFound: true,
+				Error:          missing.Error(),
+			}
+		}
 		return ProcessResult{
 			Success: false,
-			Error:   fmt.Sprintf("failed to check branch %s: %v", branch, err),
+			Error:   err.Error(),
 		}
 	}
-	if !exists {
-		return ProcessResult{
-			Success:        false,
-			BranchNotFound: true,
-			Error:          fmt.Sprintf("branch %s not found locally", branch),
-		}
-	}
+	defer worktree.cleanup()
 
-	// Step 2: Checkout the target branch
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Checking out target branch %s...\n", target)
-	if err := e.git.Checkout(target); err != nil {
+	originalGit := e.git
+	originalWorkDir := e.workDir
+	e.git = worktree.git
+	e.workDir = worktree.path
+	defer func() {
+		e.git = originalGit
+		e.workDir = originalWorkDir
+	}()
+
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Preparing source branch %s on target base %s...\n",
+		branch, shortSHA(worktree.targetBase))
+	if err := e.git.CheckoutNewBranch(worktree.tempBranch, worktree.sourceRef); err != nil {
 		return ProcessResult{
 			Success: false,
-			Error:   fmt.Sprintf("failed to checkout target %s: %v", target, err),
+			Error:   fmt.Sprintf("failed to create disposable source branch from %s: %v", worktree.sourceRef, err),
 		}
 	}
-
-	// Make sure target is up to date with origin
-	if err := e.git.Pull("origin", target); err != nil {
-		// Pull might fail if nothing to pull, that's ok
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: pull from origin/%s: %v (continuing)\n", target, err)
-	}
-
-	// Step 3: Check for merge conflicts (using local branch)
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Checking for conflicts...\n")
-	conflicts, err := e.git.CheckConflicts(branch, target)
-	if err != nil {
-		return ProcessResult{
-			Success:  false,
-			Conflict: true,
-			Error:    fmt.Sprintf("conflict check failed: %v", err),
+	if err := e.git.Rebase(worktree.targetBase); err != nil {
+		conflicts, _ := e.git.GetConflictingFiles()
+		_ = e.git.AbortRebase()
+		errMsg := fmt.Sprintf("rebase of %s onto %s failed", branch, shortSHA(worktree.targetBase))
+		if len(conflicts) > 0 {
+			errMsg = fmt.Sprintf("%s with conflicts in: %s", errMsg, strings.Join(conflicts, ", "))
 		}
-	}
-	if len(conflicts) > 0 {
 		return ProcessResult{
-			Success:  false,
-			Conflict: true,
-			Error:    fmt.Sprintf("merge conflicts in: %v", conflicts),
+			Success:       false,
+			Conflict:      true,
+			ConflictFiles: conflicts,
+			Error:         errMsg,
 		}
 	}
 
 	// Step 3.5: Push submodule commits if the branch changes submodule pointers.
 	// The refinery owns all remote pushes — submodule commits must land before the
 	// parent pointer is merged, otherwise main gets dangling submodule references.
-	subChanges, err := e.git.SubmoduleChanges(target, branch)
+	subChanges, err := e.git.SubmoduleChanges(worktree.targetBase, worktree.tempBranch)
 	if err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not check submodule changes: %v\n", err)
 	}
@@ -628,7 +807,13 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// Step 5: Perform the actual merge using squash merge
 	// Get the original commit message from the polecat branch to preserve the
 	// conventional commit format (feat:/fix:) instead of creating redundant merge commits
-	originalMsg, err := e.git.GetBranchCommitMessage(branch)
+	if err := e.git.Checkout(worktree.targetBase); err != nil {
+		return ProcessResult{
+			Success: false,
+			Error:   fmt.Sprintf("failed to reset disposable worktree to target base %s: %v", shortSHA(worktree.targetBase), err),
+		}
+	}
+	originalMsg, err := e.git.GetBranchCommitMessage(worktree.sourceRef)
 	if err != nil {
 		// Fallback to a descriptive message if we can't get the original
 		originalMsg = fmt.Sprintf("Squash merge %s into %s", branch, target)
@@ -638,16 +823,17 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not get original commit message: %v\n", err)
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Squash merging with message: %s\n", strings.TrimSpace(originalMsg))
-	if err := e.git.MergeSquash(branch, originalMsg); err != nil {
+	if err := e.git.MergeSquash(worktree.tempBranch, originalMsg); err != nil {
 		// ZFC: Use git's porcelain output to detect conflicts instead of parsing stderr.
 		// GetConflictingFiles() uses `git diff --diff-filter=U` which is proper.
 		conflicts, conflictErr := e.git.GetConflictingFiles()
 		if conflictErr == nil && len(conflicts) > 0 {
 			_ = e.git.AbortMerge()
 			return ProcessResult{
-				Success:  false,
-				Conflict: true,
-				Error:    "merge conflict during actual merge",
+				Success:       false,
+				Conflict:      true,
+				ConflictFiles: conflicts,
+				Error:         fmt.Sprintf("merge conflict during actual merge in: %s", strings.Join(conflicts, ", ")),
 			}
 		}
 		// Non-conflict failure: still need to abort to clean up dirty merge state
@@ -664,7 +850,7 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	if !shouldSkipGates {
 		postResult := e.runGatesForPhase(ctx, GatePhasePostSquash)
 		if !postResult.Success {
-			if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
+			if resetErr := e.git.ResetHard(worktree.targetBase); resetErr != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after post-squash gate failure: %v\n", target, resetErr)
 			}
 			return postResult
@@ -692,7 +878,7 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 			if slotErr != nil {
 				// Reset the checked-out target branch to origin to undo the local squash commit.
 				// ResetHard is required because target is the current branch (checked out in Step 2).
-				if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
+				if resetErr := e.git.ResetHard(worktree.targetBase); resetErr != nil {
 					_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after slot failure: %v\n", target, resetErr)
 				}
 				// Only classify as SlotTimeout for actual contention (retries exhausted).
@@ -715,11 +901,41 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 			}()
 		}
 
+		if err := e.git.FetchBranchRef("origin", target); err != nil {
+			if resetErr := e.git.ResetHard(worktree.targetBase); resetErr != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after target refresh failure: %v\n", target, resetErr)
+			}
+			return ProcessResult{
+				Success: false,
+				Error:   fmt.Sprintf("failed to refresh origin/%s before push: %v", target, err),
+			}
+		}
+		currentTarget, err := e.git.Rev("origin/" + target)
+		if err != nil {
+			if resetErr := e.git.ResetHard(worktree.targetBase); resetErr != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after target verification failure: %v\n", target, resetErr)
+			}
+			return ProcessResult{
+				Success: false,
+				Error:   fmt.Sprintf("failed to verify origin/%s before push: %v", target, err),
+			}
+		}
+		if currentTarget != worktree.targetBase {
+			if resetErr := e.git.ResetHard(worktree.targetBase); resetErr != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after target moved: %v\n", target, resetErr)
+			}
+			return ProcessResult{
+				Success:     false,
+				TargetMoved: true,
+				Error:       fmt.Sprintf("target %s moved from %s to %s while MR was prepared; retrying on fresh base", target, shortSHA(worktree.targetBase), shortSHA(currentTarget)),
+			}
+		}
+
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Pushing to origin/%s...\n", target)
-		if err := e.git.Push("origin", target, false); err != nil {
+		if err := e.git.PushRef("origin", "HEAD", target, false); err != nil {
 			// Reset the checked-out target branch to undo the local squash commit.
 			// Without this, the next retry could see stale local state from the failed push.
-			if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
+			if resetErr := e.git.ResetHard(worktree.targetBase); resetErr != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after push failure: %v\n", target, resetErr)
 			}
 			return ProcessResult{
@@ -728,7 +944,7 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 			}
 		}
 		if err := e.git.VerifyPushedCommit("origin", target, mergeCommit); err != nil {
-			if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
+			if resetErr := e.git.ResetHard(worktree.targetBase); resetErr != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after verified-push failure: %v\n", target, resetErr)
 			}
 			return ProcessResult{
@@ -1299,6 +1515,15 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 		return
 	}
 
+	// TargetMoved means the source was prepared and tested on an origin/<target>
+	// SHA that became stale before push. Keep the MR in the queue; the next poll
+	// creates a fresh disposable worktree at the newer target and retries.
+	if result.TargetMoved {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Target moved while processing %s: %s\n", mr.ID, result.Error)
+		_, _ = fmt.Fprintln(e.output, "[Engineer] MR remains in queue for automatic retry on fresh target base")
+		return
+	}
+
 	// No-merge is intentional — the source issue has no_merge=true. Not a failure.
 	// No polecat or mayor notification needed; the MR is simply dequeued.
 	if result.NoMerge {
@@ -1376,6 +1601,9 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to block MR on task: %v\n", err)
 			} else {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s blocked on conflict task %s (non-blocking delegation)\n", mr.ID, taskID)
+				if err := e.slingConflictResolutionTask(taskID, mr); err != nil {
+					_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to sling conflict task %s: %v\n", taskID, err)
+				}
 			}
 		}
 	}
@@ -1406,7 +1634,7 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 // This serializes conflict resolution - only one polecat can resolve conflicts at a time.
 // If the slot is already held, we skip creating the task and let the MR stay in queue.
 // When the current resolution completes and merges, the slot is released.
-func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult) (string, error) { // result unused but kept for future merge diagnostics
+func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, result ProcessResult) (string, error) {
 	// === MERGE SLOT GATE: Serialize conflict resolution ===
 	// Ensure merge slot exists (idempotent)
 	slotID, err := e.mergeSlotEnsureExists()
@@ -1460,6 +1688,10 @@ func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult
 
 	// Increment retry count for tracking
 	retryCount := mr.RetryCount + 1
+	conflictFiles := "unknown"
+	if len(result.ConflictFiles) > 0 {
+		conflictFiles = strings.Join(result.ConflictFiles, ", ")
+	}
 
 	// Build the task description with metadata
 	description := fmt.Sprintf(`Resolve merge conflicts for branch %s
@@ -1468,15 +1700,16 @@ func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult
 - Original MR: %s
 - Branch: %s
 - Conflict with: %s@%s
+- Conflict files: %s
 - Original issue: %s
 - Retry count: %d
 
 ## Instructions
-1. Check out the branch: git checkout %s
-2. Rebase onto target: git rebase origin/%s
-3. Resolve conflicts in your editor
-4. Complete the rebase: git add . && git rebase --continue
-5. Force-push the resolved branch: git push -f
+1. Work in a clean worktree for branch %s.
+2. Fetch latest origin/%s and rebase the branch onto it.
+3. Resolve conflicts and complete the rebase.
+4. Run the rig's configured gates.
+5. Force-push the resolved branch to origin/%s.
 6. Close this task: bd close <this-task-id>
 
 The Refinery will automatically retry the merge after you force-push.`,
@@ -1484,10 +1717,12 @@ The Refinery will automatically retry the merge after you force-push.`,
 		mr.ID,
 		mr.Branch,
 		mr.Target, shortSHA(mainSHA),
+		conflictFiles,
 		mr.SourceIssue,
 		retryCount,
 		mr.Branch,
 		mr.Target,
+		mr.Branch,
 	)
 
 	// Create the conflict resolution task
@@ -1517,6 +1752,48 @@ The Refinery will automatically retry the merge after you force-push.`,
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Created conflict resolution task: %s (P%d)\n", task.ID, task.Priority)
 
 	return task.ID, nil
+}
+
+func (e *Engineer) slingConflictResolutionTask(taskID string, mr *MRInfo) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	args := []string{
+		"sling",
+		taskID,
+		e.rig.Name,
+		"--no-boot",
+		"--base-branch=" + mr.Target,
+		"--args",
+		fmt.Sprintf("Resolve refinery merge conflict for MR %s. Branch=%s target=%s source_issue=%s. Rebase cleanly, run gates, force-push, then close %s.",
+			mr.ID, mr.Branch, mr.Target, mr.SourceIssue, taskID),
+	}
+	cmd := gtCommandContext(ctx, "gt", args...)
+	cmd.Dir = e.workDir
+	cmd.Env = mutationSubprocessEnv(os.Environ())
+	util.SetDetachedProcessGroup(cmd)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("gt sling: %s", util.FirstLine(msg))
+	}
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Slung conflict task %s to %s\n", taskID, e.rig.Name)
+	return nil
+}
+
+func mutationSubprocessEnv(base []string) []string {
+	env := make([]string, 0, len(base)+1)
+	for _, entry := range base {
+		if strings.HasPrefix(entry, "BD_READONLY=") || strings.HasPrefix(entry, "BD_DOLT_AUTO_COMMIT=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env, "BD_DOLT_AUTO_COMMIT=on")
 }
 
 // IsBeadOpen checks if a bead is still open (not closed).

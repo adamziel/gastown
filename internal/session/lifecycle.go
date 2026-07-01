@@ -172,10 +172,11 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 
 	// 3. Build startup command if not provided.
 	command := cfg.Command
+	startupPrompt := ""
 	if command == "" {
-		prompt := buildPrompt(cfg)
+		startupPrompt = buildPrompt(cfg)
 		var err error
-		command, err = buildCommand(cfg, prompt)
+		command, err = buildCommand(cfg, startupPrompt)
 		if err != nil {
 			return nil, fmt.Errorf("building startup command: %w", err)
 		}
@@ -255,7 +256,17 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		}
 	}
 
-	// 12. Verify session survived startup.
+	// 12. Deliver the startup prompt via nudge for runtimes that cannot accept
+	// a prompt argument (for example Codex's built-in prompt_mode "none").
+	// BuildCommandWithPrompt intentionally drops the prompt for those runtimes;
+	// this fallback is what actually bootstraps the agent into its GT role.
+	if startupPrompt != "" {
+		if err := runtime.DeliverStartupPromptFallback(t, cfg.SessionID, startupPrompt, runtimeConfig, constants.ClaudeStartTimeout); err != nil {
+			return nil, fmt.Errorf("delivering startup prompt fallback: %w", err)
+		}
+	}
+
+	// 13. Verify session survived startup.
 	if cfg.VerifySurvived {
 		running, err := t.HasSession(cfg.SessionID)
 		if err != nil {
@@ -268,19 +279,19 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		}
 	}
 
-	// 13. Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
+	// 14. Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
 	// Declared pane identity replaces process-tree inference in IsRuntimeRunning
 	// and FindAgentPane. Legacy sessions without GT_PANE_ID fall back to scanning.
 	if paneID, err := t.GetPaneID(cfg.SessionID); err == nil {
 		_ = t.SetEnvironment(cfg.SessionID, "GT_PANE_ID", paneID)
 	}
 
-	// 14. Track PID for defense-in-depth orphan cleanup.
+	// 15. Track PID for defense-in-depth orphan cleanup.
 	if cfg.TrackPID && cfg.TownRoot != "" {
 		_ = TrackSessionPID(cfg.TownRoot, cfg.SessionID, t)
 	}
 
-	// 14. Stream agent conversation events to VictoriaLogs (opt-in).
+	// 16. Stream agent conversation events to VictoriaLogs (opt-in).
 	// Reads ~/.claude/projects/<hash>/<session>.jsonl and emits agent.event logs.
 	// Non-fatal: observability failures must never block agent startup.
 	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" && os.Getenv("GT_OTEL_LOGS_URL") != "" {

@@ -3635,10 +3635,10 @@ func captureStderr(t *testing.T, fn func()) string {
 	return buf.String()
 }
 
-// TestBuildCommandWithPromptWarnsOnDroppedPrompt verifies that when PromptMode
-// is "none" and a non-empty prompt is provided, a warning is emitted to stderr.
-// This makes the misconfiguration self-diagnosing (issue #3803).
-func TestBuildCommandWithPromptWarnsOnDroppedPrompt(t *testing.T) {
+// TestBuildCommandWithPromptSuppressesPromptModeNoneWarning verifies that when
+// PromptMode is "none", the prompt is not appended and no warning is emitted.
+// Session startup delivers the prompt through the runtime fallback path.
+func TestBuildCommandWithPromptSuppressesPromptModeNoneWarning(t *testing.T) {
 	rc := &RuntimeConfig{
 		Command:    "claude",
 		Args:       []string{"--dangerously-skip-permissions"},
@@ -3653,14 +3653,8 @@ func TestBuildCommandWithPromptWarnsOnDroppedPrompt(t *testing.T) {
 	if strings.Contains(cmd, "GAS TOWN") {
 		t.Errorf("prompt_mode=none should prevent prompt from appearing in command, got: %s", cmd)
 	}
-	if !strings.Contains(stderr, "warning:") {
-		t.Errorf("expected a warning on stderr when prompt is dropped, got: %q", stderr)
-	}
-	if !strings.Contains(stderr, "prompt_mode") {
-		t.Errorf("warning should mention prompt_mode, got: %q", stderr)
-	}
-	if !strings.Contains(stderr, `"claude"`) {
-		t.Errorf("warning should include the agent command name, got: %q", stderr)
+	if stderr != "" {
+		t.Errorf("no warning expected when prompt_mode=none uses fallback delivery, got: %q", stderr)
 	}
 }
 
@@ -3682,9 +3676,9 @@ func TestBuildCommandWithPromptNoWarnOnEmptyPrompt(t *testing.T) {
 	}
 }
 
-// TestBuildArgsWithPromptWarnsOnDroppedPrompt verifies the parallel warning in
-// BuildArgsWithPrompt when PromptMode is "none" and a non-empty prompt is provided.
-func TestBuildArgsWithPromptWarnsOnDroppedPrompt(t *testing.T) {
+// TestBuildArgsWithPromptSuppressesPromptModeNoneWarning verifies the parallel
+// silent behavior in BuildArgsWithPrompt.
+func TestBuildArgsWithPromptSuppressesPromptModeNoneWarning(t *testing.T) {
 	rc := &RuntimeConfig{
 		Command:    "claude",
 		Args:       []string{"--dangerously-skip-permissions"},
@@ -3701,8 +3695,8 @@ func TestBuildArgsWithPromptWarnsOnDroppedPrompt(t *testing.T) {
 			t.Errorf("prompt_mode=none should prevent prompt appearing in args, got: %v", args)
 		}
 	}
-	if !strings.Contains(stderr, "warning:") {
-		t.Errorf("expected a warning on stderr when prompt is dropped, got: %q", stderr)
+	if stderr != "" {
+		t.Errorf("no warning expected when prompt_mode=none uses fallback delivery, got: %q", stderr)
 	}
 }
 
